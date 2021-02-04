@@ -1,5 +1,6 @@
 /*
  * Copyright 2012 The Netty Project
+ * Adaptation copyright 2021 Jeremy Field <jeremy.field@gmail.com>
  *
  * The Netty Project licenses this file to you under the Apache License,
  * version 2.0 (the "License"); you may not use this file except in compliance
@@ -23,10 +24,16 @@ import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.codec.DecoderResult;
-import io.netty.handler.codec.MessageAggregator;
+import io.netty.handler.codec.MixedData;
+import io.netty.handler.codec.DiskMessageAggregator;
 import io.netty.handler.codec.TooLongFrameException;
+import io.netty.handler.codec.http.multipart.DefaultHttpDataFactory;
+import io.netty.handler.codec.http.multipart.MixedAttribute;
+import io.netty.util.Attribute;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
+
+import java.io.IOException;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.CONNECTION;
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
@@ -34,58 +41,10 @@ import static io.netty.handler.codec.http.HttpHeaderNames.EXPECT;
 import static io.netty.handler.codec.http.HttpUtil.getContentLength;
 
 /**
- * A {@link ChannelHandler} that aggregates an {@link HttpMessage}
- * and its following {@link HttpContent}s into a single {@link FullHttpRequest}
- * or {@link FullHttpResponse} (depending on if it used to handle requests or responses)
- * with no following {@link HttpContent}s.  It is useful when you don't want to take
- * care of HTTP messages whose transfer encoding is 'chunked'.  Insert this
- * handler after {@link HttpResponseDecoder} in the {@link ChannelPipeline} if being used to handle
- * responses, or after {@link HttpRequestDecoder} and {@link HttpResponseEncoder} in the
- * {@link ChannelPipeline} if being used to handle requests.
- * <blockquote>
- *  <pre>
- *  {@link ChannelPipeline} p = ...;
- *  ...
- *  p.addLast("decoder", <b>new {@link HttpRequestDecoder}()</b>);
- *  p.addLast("encoder", <b>new {@link HttpResponseEncoder}()</b>);
- *  p.addLast("aggregator", <b>new {@link HttpObjectAggregator}(1048576)</b>);
- *  ...
- *  p.addLast("handler", new HttpRequestHandler());
- *  </pre>
- * </blockquote>
- * <p>
- * For convenience, consider putting a {@link HttpServerCodec} before the {@link HttpObjectAggregator}
- * as it functions as both a {@link HttpRequestDecoder} and a {@link HttpResponseEncoder}.
- * </p>
- * Be aware that {@link HttpObjectAggregator} may end up sending a {@link HttpResponse}:
- * <table border summary="Possible Responses">
- *   <tbody>
- *     <tr>
- *       <th>Response Status</th>
- *       <th>Condition When Sent</th>
- *     </tr>
- *     <tr>
- *       <td>100 Continue</td>
- *       <td>A '100-continue' expectation is received and the 'content-length' doesn't exceed maxContentLength</td>
- *     </tr>
- *     <tr>
- *       <td>417 Expectation Failed</td>
- *       <td>A '100-continue' expectation is received and the 'content-length' exceeds maxContentLength</td>
- *     </tr>
- *     <tr>
- *       <td>413 Request Entity Too Large</td>
- *       <td>Either the 'content-length' or the bytes received so far exceed maxContentLength</td>
- *     </tr>
- *   </tbody>
- * </table>
- *
- * @see FullHttpRequest
- * @see FullHttpResponse
- * @see HttpResponseDecoder
- * @see HttpServerCodec
+ * Like {@link HttpObjectAggregator} but streams large objects to disk.
  */
-public class HttpObjectAggregator
-        extends MessageAggregator<HttpObject, HttpMessage, HttpContent, FullHttpMessage> {
+public class DiskHttpObjectAggregator
+        extends DiskMessageAggregator<HttpObject, HttpMessage, HttpContent, FullHttpMessage> {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(HttpObjectAggregator.class);
     private static final FullHttpResponse CONTINUE =
             new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.CONTINUE, Unpooled.EMPTY_BUFFER);
@@ -112,7 +71,7 @@ public class HttpObjectAggregator
      * If the length of the aggregated content exceeds this value,
      * {@link #handleOversizedMessage(ChannelHandlerContext, HttpMessage)} will be called.
      */
-    public HttpObjectAggregator(int maxContentLength) {
+    public DiskHttpObjectAggregator(int maxContentLength) {
         this(maxContentLength, false);
     }
 
@@ -125,7 +84,7 @@ public class HttpObjectAggregator
      * then {@code true} means close the connection. otherwise the connection will remain open and data will be
      * consumed and discarded until the next request is received.
      */
-    public HttpObjectAggregator(int maxContentLength, boolean closeOnExpectationFailed) {
+    public DiskHttpObjectAggregator(int maxContentLength, boolean closeOnExpectationFailed) {
         super(maxContentLength);
         this.closeOnExpectationFailed = closeOnExpectationFailed;
     }
@@ -202,7 +161,7 @@ public class HttpObjectAggregator
     }
 
     @Override
-    protected FullHttpMessage beginAggregation(HttpMessage start, ByteBuf content) throws Exception {
+    protected AggregatedFullHttpMessage beginAggregation(HttpMessage start, ByteBuf content) throws Exception {
         assert !(start instanceof FullHttpMessage);
 
         HttpUtil.setTransferEncodingChunked(start, false);
@@ -279,15 +238,24 @@ public class HttpObjectAggregator
         }
     }
 
-    private abstract static class AggregatedFullHttpMessage implements FullHttpMessage {
+    private abstract static class AggregatedFullHttpMessage implements FullHttpMessage, MixedData {
         protected final HttpMessage message;
-        private final ByteBuf content;
+        private final MixedAttribute storage;
         private HttpHeaders trailingHeaders;
 
         AggregatedFullHttpMessage(HttpMessage message, ByteBuf content, HttpHeaders trailingHeaders) {
             this.message = message;
-            this.content = content;
+            this.storage = new MixedAttribute("aggregator", DefaultHttpDataFactory.MINSIZE);
+            try {
+                storage.setContent(content);
+            } catch (IOException e) {
+                logger.error("Unable to create aggregator", e);
+            }
             this.trailingHeaders = trailingHeaders;
+        }
+
+        public void addContent(ByteBuf buffer, boolean last) throws IOException {
+            this.storage.addContent(buffer, last);
         }
 
         @Override
@@ -342,46 +310,46 @@ public class HttpObjectAggregator
 
         @Override
         public ByteBuf content() {
-            return content;
+            return this.storage.content();
         }
 
         @Override
         public int refCnt() {
-            return content.refCnt();
+            return this.storage.content().refCnt();
         }
 
         @Override
         public FullHttpMessage retain() {
-            content.retain();
+            this.storage.content().retain();
             return this;
         }
 
         @Override
         public FullHttpMessage retain(int increment) {
-            content.retain(increment);
+            this.storage.content().retain(increment);
             return this;
         }
 
         @Override
         public FullHttpMessage touch(Object hint) {
-            content.touch(hint);
+            this.storage.content().touch(hint);
             return this;
         }
 
         @Override
         public FullHttpMessage touch() {
-            content.touch();
+            this.storage.content().touch();
             return this;
         }
 
         @Override
         public boolean release() {
-            return content.release();
+            return this.storage.content().release();
         }
 
         @Override
         public boolean release(int decrement) {
-            return content.release(decrement);
+            return this.storage.content().release(decrement);
         }
 
         @Override

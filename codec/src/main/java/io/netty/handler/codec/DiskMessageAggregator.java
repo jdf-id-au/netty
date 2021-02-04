@@ -1,5 +1,6 @@
 /*
  * Copyright 2012 The Netty Project
+ * Adaptation copyright 2021 Jeremy Field <jeremy.field@gmail.com>
  *
  * The Netty Project licenses this file to you under the Apache License,
  * version 2.0 (the "License"); you may not use this file except in compliance
@@ -18,6 +19,7 @@ package io.netty.handler.codec;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufHolder;
 import io.netty.buffer.CompositeByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandler;
@@ -49,7 +51,7 @@ import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
  * @param <C> the type of the content message (must be a subtype of {@link ByteBufHolder})
  * @param <O> the type of the aggregated message (must be a subtype of {@code S} and {@link ByteBufHolder})
  */
-public abstract class MessageAggregator<I, S, C extends ByteBufHolder, O extends ByteBufHolder>
+public abstract class DiskMessageAggregator<I, S, C extends ByteBufHolder, O extends ByteBufHolder>
         extends MessageToMessageDecoder<I> {
 
     private static final int DEFAULT_MAX_COMPOSITEBUFFER_COMPONENTS = 1024;
@@ -72,12 +74,12 @@ public abstract class MessageAggregator<I, S, C extends ByteBufHolder, O extends
      *        If the length of the aggregated content exceeds this value,
      *        {@link #handleOversizedMessage(ChannelHandlerContext, Object)} will be called.
      */
-    protected MessageAggregator(int maxContentLength) {
+    protected DiskMessageAggregator(int maxContentLength) {
         validateMaxContentLength(maxContentLength);
         this.maxContentLength = maxContentLength;
     }
 
-    protected MessageAggregator(int maxContentLength, Class<? extends I> inboundMessageType) {
+    protected DiskMessageAggregator(int maxContentLength, Class<? extends I> inboundMessageType) {
         super(inboundMessageType);
         validateMaxContentLength(maxContentLength);
         this.maxContentLength = maxContentLength;
@@ -268,11 +270,11 @@ public abstract class MessageAggregator<I, S, C extends ByteBufHolder, O extends
             }
 
             // A streamed message - initialize the cumulative buffer, and wait for incoming chunks.
-            CompositeByteBuf content = ctx.alloc().compositeBuffer(maxCumulationBufferComponents);
             if (m instanceof ByteBufHolder) {
-                appendPartialContent(content, ((ByteBufHolder) m).content());
+                currentMessage = beginAggregation(m, ((ByteBufHolder) m).content());
+            } else {
+                currentMessage = beginAggregation(m, Unpooled.EMPTY_BUFFER);
             }
-            currentMessage = beginAggregation(m, content);
         } else if (isContentMessage(msg)) {
             if (currentMessage == null) {
                 // it is possible that a TooLongFrameException was already thrown but we can still discard data
@@ -281,11 +283,12 @@ public abstract class MessageAggregator<I, S, C extends ByteBufHolder, O extends
             }
 
             // Merge the received chunk into the content of the current message.
-            CompositeByteBuf content = (CompositeByteBuf) currentMessage.content();
+            ByteBuf content = currentMessage.content();
 
             @SuppressWarnings("unchecked")
             final C m = (C) msg;
             // Handle oversized message.
+            // Don't quite understand when writerIndex changes
             if (content.readableBytes() > maxContentLength - m.content().readableBytes()) {
                 // By convention, full message type extends first message type.
                 @SuppressWarnings("unchecked")
@@ -295,7 +298,10 @@ public abstract class MessageAggregator<I, S, C extends ByteBufHolder, O extends
             }
 
             // Append the content of the chunk.
-            appendPartialContent(content, m.content());
+            if (m.content().isReadable()) {
+                MixedData d = (MixedData) currentMessage;
+                d.addContent(m.content().retain(), isLastContentMessage(m));
+            }
 
             // Give the subtypes a chance to merge additional information such as trailing headers.
             aggregate(currentMessage, m);
@@ -325,12 +331,6 @@ public abstract class MessageAggregator<I, S, C extends ByteBufHolder, O extends
             }
         } else {
             throw new MessageAggregationException();
-        }
-    }
-
-    private static void appendPartialContent(CompositeByteBuf content, ByteBuf partialContent) {
-        if (partialContent.isReadable()) {
-            content.addComponent(true, partialContent.retain());
         }
     }
 
