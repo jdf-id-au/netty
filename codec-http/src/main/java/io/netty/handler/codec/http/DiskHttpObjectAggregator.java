@@ -6,7 +6,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   https://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -29,10 +29,12 @@ import io.netty.handler.codec.DiskMessageAggregator;
 import io.netty.handler.codec.TooLongFrameException;
 import io.netty.handler.codec.http.multipart.DefaultHttpDataFactory;
 import io.netty.handler.codec.http.multipart.MixedAttribute;
+import io.netty.handler.codec.http.multipart.MixedFileUpload;
 import io.netty.util.Attribute;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.io.File;
 import java.io.IOException;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.CONNECTION;
@@ -71,7 +73,7 @@ public class DiskHttpObjectAggregator
      * If the length of the aggregated content exceeds this value,
      * {@link #handleOversizedMessage(ChannelHandlerContext, HttpMessage)} will be called.
      */
-    public DiskHttpObjectAggregator(int maxContentLength) {
+    public DiskHttpObjectAggregator(long maxContentLength) {
         this(maxContentLength, false);
     }
 
@@ -84,7 +86,7 @@ public class DiskHttpObjectAggregator
      * then {@code true} means close the connection. otherwise the connection will remain open and data will be
      * consumed and discarded until the next request is received.
      */
-    public DiskHttpObjectAggregator(int maxContentLength, boolean closeOnExpectationFailed) {
+    public DiskHttpObjectAggregator(long maxContentLength, boolean closeOnExpectationFailed) {
         super(maxContentLength);
         this.closeOnExpectationFailed = closeOnExpectationFailed;
     }
@@ -110,7 +112,7 @@ public class DiskHttpObjectAggregator
     }
 
     @Override
-    protected boolean isContentLengthInvalid(HttpMessage start, int maxContentLength) {
+    protected boolean isContentLengthInvalid(HttpMessage start, long maxContentLength) {
         try {
             return getContentLength(start, -1L) > maxContentLength;
         } catch (final NumberFormatException e) {
@@ -118,7 +120,7 @@ public class DiskHttpObjectAggregator
         }
     }
 
-    private static Object continueResponse(HttpMessage start, int maxContentLength, ChannelPipeline pipeline) {
+    private static Object continueResponse(HttpMessage start, long maxContentLength, ChannelPipeline pipeline) {
         if (HttpUtil.isUnsupportedExpectation(start)) {
             // if the request contains an unsupported expectation, we return 417
             pipeline.fireUserEventTriggered(HttpExpectationFailedEvent.INSTANCE);
@@ -136,7 +138,7 @@ public class DiskHttpObjectAggregator
     }
 
     @Override
-    protected Object newContinueResponse(HttpMessage start, int maxContentLength, ChannelPipeline pipeline) {
+    protected Object newContinueResponse(HttpMessage start, long maxContentLength, ChannelPipeline pipeline) {
         Object response = continueResponse(start, maxContentLength, pipeline);
         // we're going to respond based on the request expectation so there's no
         // need to propagate the expectation further.
@@ -247,7 +249,8 @@ public class DiskHttpObjectAggregator
             this.message = message;
             this.storage = new MixedAttribute("aggregator", DefaultHttpDataFactory.MINSIZE);
             try {
-                storage.setContent(content);
+                storage.setContent(content); // (potentially) misleadingly does setCompleted()
+//                storage.addContent(content, false);
             } catch (IOException e) {
                 logger.error("Unable to create aggregator", e);
             }
@@ -255,7 +258,34 @@ public class DiskHttpObjectAggregator
         }
 
         public void addContent(ByteBuf buffer, boolean last) throws IOException {
-            this.storage.addContent(buffer, last);
+            this.storage.addContent(buffer, last); // misleadingly setCompleted() in AMHD
+            // FIXME
+            // is fileChannel.position returning 0 all the time?
+            // file is exactly 9KB (which is transition from memory to file) no matter how much extra content
+            // seems to be writing each ByteBuf back to the start of the file instead of growing
+            // https://stackoverflow.com/questions/28137095/why-does-position-method-of-filechannel-return-zero-always (although that was read-only)
+            logger.info(
+                " buffer " + buffer.readableBytes() +
+                " last " + last +
+                " defined length " + this.storage.definedLength() +
+                " storage length " + this.storage.length() + // seemingly 8KB chunks
+                " isInMemory " + this.storage.isInMemory() +
+                " isCompleted " + this.storage.isCompleted() + // misleadingly? true when initially in memory
+                " getFile " + (this.storage.isInMemory() ? "n/a" : this.storage.getFile()) +
+                " file length " + (this.storage.isInMemory() ? "n/a" :this.storage.getFile().length() )
+            );
+        }
+
+        public byte[] get() throws IOException {
+            return this.storage.get();
+        }
+
+        public boolean isInMemory() {
+            return this.storage.isInMemory();
+        }
+
+        public File getFile() throws IOException {
+            return this.storage.getFile();
         }
 
         @Override
@@ -315,41 +345,41 @@ public class DiskHttpObjectAggregator
 
         @Override
         public int refCnt() {
-            return this.storage.content().refCnt();
+            return this.storage.refCnt();
         }
 
         @Override
         public FullHttpMessage retain() {
-            this.storage.content().retain();
+            this.storage.retain();
             return this;
         }
 
         @Override
         public FullHttpMessage retain(int increment) {
-            this.storage.content().retain(increment);
+            this.storage.retain(increment);
             return this;
         }
 
         @Override
         public FullHttpMessage touch(Object hint) {
-            this.storage.content().touch(hint);
+            this.storage.touch(hint);
             return this;
         }
 
         @Override
         public FullHttpMessage touch() {
-            this.storage.content().touch();
+            this.storage.touch();
             return this;
         }
 
         @Override
         public boolean release() {
-            return this.storage.content().release();
+            return this.storage.release();
         }
 
         @Override
         public boolean release(int decrement) {
-            return this.storage.content().release(decrement);
+            return this.storage.release(decrement);
         }
 
         @Override
