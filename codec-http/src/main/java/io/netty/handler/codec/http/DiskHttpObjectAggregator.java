@@ -259,21 +259,6 @@ public class DiskHttpObjectAggregator
 
         public void addContent(ByteBuf buffer, boolean last) throws IOException {
             this.storage.addContent(buffer, last); // misleadingly setCompleted() in AMHD
-            // FIXME
-            // is fileChannel.position returning 0 all the time?
-            // file is exactly 9KB (which is transition from memory to file) no matter how much extra content
-            // seems to be writing each ByteBuf back to the start of the file instead of growing
-            // https://stackoverflow.com/questions/28137095/why-does-position-method-of-filechannel-return-zero-always (although that was read-only)
-            logger.info(
-                " buffer " + buffer.readableBytes() +
-                " last " + last +
-                " defined length " + this.storage.definedLength() +
-                " storage length " + this.storage.length() + // seemingly 8KB chunks
-                " isInMemory " + this.storage.isInMemory() +
-                " isCompleted " + this.storage.isCompleted() + // misleadingly? true when initially in memory
-                " getFile " + (this.storage.isInMemory() ? "n/a" : this.storage.getFile()) +
-                " file length " + (this.storage.isInMemory() ? "n/a" :this.storage.getFile().length() )
-            );
         }
 
         public byte[] get() throws IOException {
